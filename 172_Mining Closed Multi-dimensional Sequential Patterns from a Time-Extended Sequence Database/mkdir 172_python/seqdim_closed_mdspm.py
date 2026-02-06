@@ -74,6 +74,12 @@ class Sequence:
     def getAbsoluteSupport(self):
         return len(self._sids)
 
+    def getSequencesID(self):
+        return self._sids if hasattr(self, '_sids') and self._sids is not None else set()
+
+    def get(self, index: int):
+        return self.itemsets[index]
+
     def toStringShort(self):
         out = []
         for it in self.itemsets:
@@ -303,78 +309,100 @@ class AlgoDim:
         return closed
 
 
-class AlgoSeq:
-    """Equivalent to AlgoFournierViger08.java (simplified, but with closed filtering)"""
-    def runAlgorithm(self, seqdb: SequenceDatabase, minsup: float):
-        minsupp_abs = int(math.ceil(minsup * seqdb.size()))
-        if minsupp_abs <= 0:
-            minsupp_abs = 1
-
-        patterns = {}
-
-        for seq in seqdb.getSequences():
-            reps = self._enumerate_all_subsequences(seq)
-            for rep in reps:
-                patterns.setdefault(rep, set()).add(seq.sid)
-
-        seqs = []
-        for rep, sids in patterns.items():
-            if len(sids) >= minsupp_abs:
-                s = self._rep_to_seq(rep)
-                s.setSequencesID(sids)
-                seqs.append(s)
-
-        # closed sequential patterns
-        closed = []
-        for s in seqs:
-            is_closed = True
-            for t in seqs:
-                if s is t:
-                    continue
-                if t.getAbsoluteSupport() != s.getAbsoluteSupport():
-                    continue
-                if t.strictlyContains(s):
-                    is_closed = False
+def _mine_closed_sequential_patterns(seqdb_172, minsup: float):
+    """
+    Mine closed sequential patterns from the sequence part of the MD database.
+    Uses enumerate-all + closed filter (same closed definition as Java).
+    Returns list of 172-style Sequence with getSequencesID() set.
+    """
+    minsupp_abs = max(1, int(math.ceil(minsup * len(seqdb_172))))
+    patterns = {}
+    for (md, seq) in seqdb_172:
+        for rep in _enumerate_subsequences(seq):
+            patterns.setdefault(rep, set()).add(seq.sid)
+    seqs = []
+    for rep, sids in patterns.items():
+        if len(sids) < minsupp_abs:
+            continue
+        s = _rep_to_sequence(rep)
+        s.setSequencesID(sids)
+        seqs.append(s)
+    # Closed: keep only if no strict superset with same support
+    closed = []
+    for s in seqs:
+        if any(
+            t is not s
+            and t.getAbsoluteSupport() == s.getAbsoluteSupport()
+            and t.strictlyContains(s)
+            for t in seqs
+        ):
+            continue
+        closed.append(s)
+    # Match Java FV08: keep only closed seq patterns that are not a
+    # (flexible) subsequence of another closed pattern with same support.
+    # This prunes e.g. {t=0,3} when {t=0,2}{t=1,3} exists with same support.
+    def is_subsequence_of(a, b):
+        if b.size() < a.size():
+            return False
+        j = 0
+        for i in range(a.size()):
+            ai = a.get(i)
+            need = set(x.getId() for x in ai.getItems())
+            while j < b.size():
+                bj = b.get(j)
+                have = set(x.getId() for x in bj.getItems())
+                if need.issubset(have):
+                    j += 1
                     break
-            if is_closed:
-                closed.append(s)
+                j += 1
+            else:
+                return False
+        return True
 
-        # stable order: longer first, then string
-        closed.sort(key=lambda x: (-x.size(), x.toStringShort()))
-        return closed
+    maximal_closed = []
+    for s in closed:
+        if any(
+            t is not s
+            and t.getAbsoluteSupport() == s.getAbsoluteSupport()
+            and t.size() > s.size()
+            and is_subsequence_of(s, t)
+            for t in closed
+        ):
+            continue
+        maximal_closed.append(s)
+    maximal_closed.sort(key=lambda x: (-x.size(), x.toStringShort()))
+    return maximal_closed
 
-    def _enumerate_all_subsequences(self, seq: Sequence):
-        its = seq.getItemsets()
-        results = set()
 
-        for r in range(1, len(its) + 1):
-            for idxs in combinations(range(len(its)), r):
-                base_time = its[idxs[0]].getTimestamp()
+def _enumerate_subsequences(seq: Sequence):
+    its = seq.getItemsets()
+    results = set()
+    for r in range(1, len(its) + 1):
+        for idxs in combinations(range(len(its)), r):
+            base_time = its[idxs[0]].getTimestamp()
+            parts = []
+            for i in idxs:
+                ts = its[i].getTimestamp() - base_time
+                items = [x.getId() for x in its[i].getItems()]
+                opts = []
+                for k in range(1, len(items) + 1):
+                    for c in combinations(items, k):
+                        opts.append((ts, tuple(c)))
+                parts.append(opts)
+            for prod in product(*parts):
+                results.add(tuple(prod))
+    return results
 
-                parts = []
-                for i in idxs:
-                    ts = its[i].getTimestamp() - base_time
-                    items = [x.getId() for x in its[i].getItems()]
-                    item_combos = []
-                    for k in range(1, len(items) + 1):
-                        for c in combinations(items, k):
-                            item_combos.append((ts, tuple(c)))
-                    parts.append(item_combos)
 
-                for prod in product(*parts):
-                    results.add(tuple(prod))
-
-        return results
-
-    def _rep_to_seq(self, rep):
-        s = Sequence(0)
-        for t, items in rep:
-            s.addItemset(Itemset([ItemSimple(x) for x in items], t))
-        return s
+def _rep_to_sequence(rep):
+    s = Sequence(0)
+    for t, items in rep:
+        s.addItemset(Itemset([ItemSimple(x) for x in items], t))
+    return s
 
 
 class AlgoSeqDim:
-    """Equivalent to AlgoSeqDim.java"""
+    """Equivalent to AlgoSeqDim.java: closed seq first, then project MD DB and run AlgoDim (Charm)."""
     def __init__(self):
         self.patternCount = 0
         self.startTime = 0
@@ -385,52 +413,51 @@ class AlgoSeqDim:
         self.patternCount = 0
         self.startTime = int(time.time() * 1000)
 
-        algoDim = AlgoDim()
-        closed_md = algoDim.runAlgorithm(db.mdpats, minsup)
+        # (1) Mine closed sequential patterns (enumerate-all + closed filter)
+        closed_seqs = _mine_closed_sequential_patterns(db.mdseqs, minsup)
 
+        algoDim = AlgoDim()
         all_patterns = []
 
-        for mdpat in closed_md:
-            proj = SequenceDatabase()
-            for (p, s) in db.mdseqs:
-                if mdpat.matches(p):
-                    proj.addSequence(s)
-
-            if proj.size() == 0:
+        # (2) For each closed sequential pattern: project MD database and run AlgoDim (Charm)
+        for seq in closed_seqs:
+            sids = seq.getSequencesID()
+            projected_mdpats = [db.mdpats[i] for i in sids]
+            if not projected_mdpats:
                 continue
+            newMinSupp = minsup * db.size() / len(projected_mdpats)
+            closed_md = algoDim.runAlgorithm(projected_mdpats, newMinSupp)
 
-            newMin = minsup * db.size() / proj.size()
-
-            algoSeq = AlgoSeq()
-            seqs = algoSeq.runAlgorithm(proj, newMin)
-
-            for s in seqs:
-                mds = MDSequence(mdpat, s)
-                mds.setSupport(s.getAbsoluteSupport())
+            for mdpat in closed_md:
+                mds = MDSequence(mdpat, seq)
+                if mdpat.isAllWildcards():
+                    mds.setSupport(len(sids))
+                else:
+                    mds.setSupport(mdpat.getAbsoluteSupport())
                 all_patterns.append(mds)
+                self.patternCount += 1
 
-        # final CLOSED on combined patterns
+        # (3) Remove redundancy: keep only closed MD-sequences (Java removeRedundancy)
         final = []
         for p in all_patterns:
-            is_closed = True
+            included = False
             for q in all_patterns:
                 if p is q:
                     continue
                 if q.getAbsoluteSupport() != p.getAbsoluteSupport():
                     continue
                 if q.contains(p):
-                    is_closed = False
+                    included = True
                     break
-            if is_closed:
+            if not included:
                 final.append(p)
 
-        # output ordering: try to match java feel (longer seq first, then md string, then seq string)
+        # output ordering: match Java (level/length then string)
         final.sort(key=lambda x: (-x.seq.size(), x.md.toStringShort(), x.seq.toStringShort()))
 
         with open(outpath, "w", encoding="utf-8") as f:
             for r in final:
                 f.write(r.md.toStringShort() + r.seq.toStringShort() + " #SUP: " + str(r.getAbsoluteSupport()) + "\n")
-                self.patternCount += 1
 
         self.endTime = int(time.time() * 1000)
         MemoryLogger.getInstance().checkMemory()
